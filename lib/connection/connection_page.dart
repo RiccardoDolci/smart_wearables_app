@@ -1,17 +1,18 @@
-import 'dart:async'; 
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
-import 'package:smart_wearables_app/connection/stream.dart';
+import 'package:smart_wearables_app/connection/ble_protocol.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:smart_wearables_app/home_page.dart';
+import 'package:smart_wearables_app/connected_scaffold.dart';
 
-// --- BLE Service and Characteristic UUIDs ---
-// These are the specific addresses for the BLE device RN4871 (Microchip) on the board.
+// --- BLE Service and Characteristic UUIDs (RN4871 Transparent UART) ---
+// See ble_protocol.md section 1.
 Uuid serviceUuid = Uuid.parse("49535343-FE7D-4AE5-8FA9-9FAFD205E455");
-Uuid characteristicUuid = Uuid.parse("49535343-1E4D-4BD9-BA61-23C647249616"); // RX Characteristic 
-Uuid characteristicUuidTX = Uuid.parse("49535343-8841-43F4-A8D4-ECBE34729BB3"); // TX Characteristic 
+Uuid characteristicUuid =
+    Uuid.parse("49535343-1E4D-4BD9-BA61-23C647249616"); // Board -> App (notify)
+Uuid characteristicUuidTX =
+    Uuid.parse("49535343-8841-43F4-A8D4-ECBE34729BB3"); // App -> Board (write)
 
-// --- 1. Widget Definition ---
 class ConnectionPage extends StatefulWidget {
   const ConnectionPage({super.key, required this.title});
   final String title;
@@ -20,9 +21,8 @@ class ConnectionPage extends StatefulWidget {
   State<ConnectionPage> createState() => _ConnectionPageState();
 }
 
-// --- 2. Widget's State Definition ---
 class _ConnectionPageState extends State<ConnectionPage> {
-  // A filter to only show BLE devices having "BLE_SW" as name
+  // Only show BLE devices whose name contains this.
   final String bleDeviceNameFilter = "BLE_SW";
 
   final flutterReactiveBle = FlutterReactiveBle();
@@ -31,27 +31,28 @@ class _ConnectionPageState extends State<ConnectionPage> {
   late Stream<ConnectionStateUpdate> currentConnectionStream;
   late StreamSubscription<ConnectionStateUpdate> connection;
 
-  // The RX (Receive) and TX (Transmit) characteristics of the connected device
-  late QualifiedCharacteristic _rxCharacteristic;
-  late QualifiedCharacteristic _txCharacteristic;
+  QualifiedCharacteristic? _rxCharacteristic;
+  QualifiedCharacteristic? _txCharacteristic;
+  StreamSubscription<List<int>>? _notifySub;
+  StreamSubscription<List<int>>? _outgoingSub;
 
-  List<DiscoveredDevice> foundBleDevices = []; // All found devices
-  List<DiscoveredDevice> foundBleDevicesFiltered = []; // Only the ones matching the filter
+  List<DiscoveredDevice> foundBleDevices = [];
+  List<DiscoveredDevice> foundBleDevicesFiltered = [];
 
   bool permGranted = false;
   bool scanning = false;
   bool connecting = false;
   bool connected = false;
 
-  MyStream incomingBLEStream = MyStream();
+  // The protocol/data layer for the active connection.
+  BleProtocol? _protocol;
 
   void refreshScreen() {
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   // --- Permission Handling ---
 
-  // Shows a dialog if permissions are not granted
   Future<void> _showNoPermissionDialog() async => showDialog<void>(
         context: context,
         barrierDismissible: false,
@@ -69,15 +70,12 @@ class _ConnectionPageState extends State<ConnectionPage> {
           actions: <Widget>[
             TextButton(
               child: const Text('Acknowledge'),
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
+              onPressed: () => Navigator.of(context).pop(),
             ),
           ],
         ),
       );
 
-  // Asks the user for all required permissions
   void _askPermissions() async {
     Map<Permission, PermissionStatus> statuses = await [
       Permission.bluetoothScan,
@@ -85,14 +83,11 @@ class _ConnectionPageState extends State<ConnectionPage> {
       Permission.bluetoothConnect
     ].request();
 
-    // Check if ALL permissions were granted
     if (statuses[Permission.bluetoothScan] == PermissionStatus.granted &&
         statuses[Permission.bluetoothConnect] == PermissionStatus.granted &&
         statuses[Permission.locationWhenInUse] == PermissionStatus.granted) {
       permGranted = true;
-      if (!scanning) {
-        _startScan();
-      }
+      if (!scanning) _startScan();
     } else {
       permGranted = false;
     }
@@ -100,18 +95,14 @@ class _ConnectionPageState extends State<ConnectionPage> {
 
   // --- Scan Logic ---
 
-  // Stops the BLE scan
   void _stopScan() async {
     await scanStream.cancel();
     scanning = false;
     refreshScreen();
   }
 
-  // Starts the BLE scan
   void _startScan() async {
-    if (scanning) {
-      _stopScan();
-    }
+    if (scanning) _stopScan();
 
     if (permGranted) {
       foundBleDevices = [];
@@ -119,9 +110,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
       scanning = true;
       refreshScreen();
 
-      scanStream = flutterReactiveBle
-          .scanForDevices(withServices: [/*serviceUuid*/])
-          .listen((device) {
+      scanStream =
+          flutterReactiveBle.scanForDevices(withServices: []).listen((device) {
         if (foundBleDevices.every((element) => element.id != device.id)) {
           foundBleDevices.add(device);
           if (device.name.contains(bleDeviceNameFilter)) {
@@ -134,14 +124,9 @@ class _ConnectionPageState extends State<ConnectionPage> {
         refreshScreen();
       });
 
-      Future.delayed(
-        const Duration(seconds: 10),
-        () {
-          if (scanning) {
-            _stopScan();
-          }
-        },
-      );
+      Future.delayed(const Duration(seconds: 10), () {
+        if (scanning) _stopScan();
+      });
     } else {
       await _showNoPermissionDialog();
     }
@@ -156,46 +141,37 @@ class _ConnectionPageState extends State<ConnectionPage> {
     }
 
     if (!connected) {
-      setState(() {
-        connecting = true;
-      });
+      setState(() => connecting = true);
 
-      // Request MTU (Maximum Transmission Unit):
-      final mtu = await flutterReactiveBle.requestMtu(
-          deviceId: foundBleDevicesFiltered[index].id, mtu: 512);
+      final deviceId = foundBleDevicesFiltered[index].id;
+
+      // Larger MTU helps batched IR lines arrive in one notification.
+      await flutterReactiveBle.requestMtu(deviceId: deviceId, mtu: 512);
 
       currentConnectionStream = flutterReactiveBle.connectToDevice(
-        id: foundBleDevicesFiltered[index].id,
+        id: deviceId,
         connectionTimeout: const Duration(seconds: 5),
       );
 
       connection = currentConnectionStream.listen((event) {
-        var id = event.deviceId.toString();
         switch (event.connectionState) {
           case DeviceConnectionState.connecting:
-            {
-              connectingProcedure(id);
-              break;
-            }
+            connectingProcedure(event.deviceId);
           case DeviceConnectionState.connected:
-            {
-              connectionProcedure(id, event);
-              break;
-            }
+            connectionProcedure(event.deviceId, event);
           case DeviceConnectionState.disconnected:
-            {
-              disconnectionProcedure(id);
-              break;
-            }
+            disconnectionProcedure(event.deviceId);
           default:
         }
         refreshScreen();
       }, onError: (Object error) {
         connecting = false;
         connected = false;
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text("Connection failed!"),
-        ));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text("Connection failed!")),
+          );
+        }
         debugPrint("ERROR during connection: $error \n");
         _startScan();
         refreshScreen();
@@ -209,90 +185,118 @@ class _ConnectionPageState extends State<ConnectionPage> {
     debugPrint("Connecting to $id...\n");
   }
 
-  void connectionProcedure(String id, ConnectionStateUpdate event){ 
+  void connectionProcedure(String id, ConnectionStateUpdate event) {
     connected = true;
     connecting = false;
     debugPrint("Connected to $id\n");
 
-    // --- 1. Setup RECEIVE (RX) ---
+    final protocol = BleProtocol();
+    _protocol = protocol;
+
+    // --- 0. DEBUG: enumerate the real GATT services/characteristics. ---
+    _dumpServices(event.deviceId);
+
+    // --- 1. RECEIVE (notify): feed raw chunks into the line parser. ---
     _rxCharacteristic = QualifiedCharacteristic(
-        serviceId: serviceUuid,
-        characteristicId: characteristicUuid,
-        deviceId: event.deviceId);
+      serviceId: serviceUuid,
+      characteristicId: characteristicUuid,
+      deviceId: event.deviceId,
+    );
+    _notifySub = flutterReactiveBle
+        .subscribeToCharacteristic(_rxCharacteristic!)
+        .listen(protocol.ingest, onError: (Object error) {
+      debugPrint("ERROR during RX listen: $error\n");
+    });
 
-    // --- Packet Buffering Logic ---
-    const int fixedPacketLength = 20; // Our custom packet length (in bytes)
-    List<int> packetBuffer = []; // Temporary buffer
-
-    flutterReactiveBle.subscribeToCharacteristic(_rxCharacteristic).listen(
-        (packet) {
-      debugPrint("Raw packet: ${packet.length} bytes --> $packet ");
-
-      if ((packetBuffer.length + packet.length) / fixedPacketLength < 1) {
-        debugPrint("pacchetto brutto: ${packet.length}");
-      } else {
-        packetBuffer.addAll(packet);
-        int numPacketsReceived = (packetBuffer.length / fixedPacketLength).floor();
-
-        for (int i = 0; i < numPacketsReceived; i++) {
-          List<int> data = packetBuffer.sublist(0, fixedPacketLength);
-          packetBuffer.removeRange(0, fixedPacketLength);
-
-          // data[0] == '{' (ASCII 123) AND data[19] == '}' (ASCII 125)
-          if (data[0] == 123 && data[fixedPacketLength - 1] == 125) {
-            incomingBLEStream.setNum(data);
-            debugPrint("Valid packet received (Type: ${String.fromCharCode(data[1])})");
-          } else {
-            debugPrint("Discarding invalid packet: $data");
-          }
+    // --- 2. TRANSMIT (write): forward outgoing command bytes. ---
+    _txCharacteristic = QualifiedCharacteristic(
+      serviceId: serviceUuid,
+      characteristicId: characteristicUuidTX,
+      deviceId: event.deviceId,
+    );
+    _outgoingSub = protocol.outgoing.listen((bytes) async {
+      // RN4871 transparent UART: prefer write-WITH-response (confirms the
+      // command actually reached the module). Fall back to without-response.
+      try {
+        await flutterReactiveBle.writeCharacteristicWithResponse(
+          _txCharacteristic!,
+          value: bytes,
+        );
+        debugPrint("TX ok (with response): $bytes");
+      } catch (e) {
+        debugPrint("TX with-response FAILED: $e -> retry without response");
+        try {
+          await flutterReactiveBle.writeCharacteristicWithoutResponse(
+            _txCharacteristic!,
+            value: bytes,
+          );
+          debugPrint("TX ok (without response): $bytes");
+        } catch (e2) {
+          debugPrint("TX without-response ALSO FAILED: $e2");
         }
       }
-    }, onError: (dynamic error) {
-      debugPrint("ERROR during RX listen: ${error.toString()}\n");
     });
 
-    // --- 2. Setup TRANSMIT (TX) ---
-    _txCharacteristic = QualifiedCharacteristic(
-        serviceId: serviceUuid,
-        characteristicId: characteristicUuidTX,
-        deviceId: event.deviceId);
+    // --- 3. Set time on connect (ble_protocol.md §6/§7). Small delay so
+    //         service discovery + notify subscription settle first. ---
+    Future.delayed(const Duration(milliseconds: 600), protocol.sendSetTime);
 
-    incomingBLEStream.controllerSend.stream.listen((event) async {
-      flutterReactiveBle
-          .writeCharacteristicWithoutResponse(_txCharacteristic, value: event);
-    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text("Connected!")),
+    );
 
-    // --- 3. Navigation ---
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-      content: Text("Connected!"),
-    ));
-
-    // Go to the next page (HomePage)
+    // --- 4. Go to the connected scaffold (Live + Storico). ---
     Navigator.push(
       context,
       MaterialPageRoute(
-          builder: (context) => HomePage(
-                title: "Sensors Data",
-                stream: incomingBLEStream,
-              )),
-    ).whenComplete(() => forceDisconnection());
+        builder: (context) => ConnectedScaffold(protocol: protocol),
+      ),
+    ).whenComplete(forceDisconnection);
+  }
+
+  // DEBUG: discover and print every service + characteristic and its
+  // properties, so we can confirm which characteristic actually notifies.
+  void _dumpServices(String deviceId) async {
+    try {
+      await flutterReactiveBle.discoverAllServices(deviceId);
+      final services = await flutterReactiveBle.getDiscoveredServices(deviceId);
+      debugPrint("=== GATT dump: ${services.length} services ===");
+      for (final s in services) {
+        debugPrint("Service ${s.id}");
+        for (final c in s.characteristics) {
+          debugPrint("  Char ${c.id} "
+              "notify=${c.isNotifiable} indicate=${c.isIndicatable} "
+              "write=${c.isWritableWithResponse} "
+              "writeNR=${c.isWritableWithoutResponse} read=${c.isReadable}");
+        }
+      }
+      debugPrint("=== end GATT dump ===");
+    } catch (e) {
+      debugPrint("GATT discovery FAILED: $e");
+    }
   }
 
   void disconnectionProcedure(String id) {
     if (connected) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text("Disconnected!"),
-      ));
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text("Not connected!"),
-      ));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Disconnected!")),
+      );
     }
+    _teardownConnection();
     connected = false;
     connecting = false;
     debugPrint("Disconnected from $id\n");
 
     Navigator.popUntil(context, (route) => route.isFirst);
+  }
+
+  void _teardownConnection() {
+    _notifySub?.cancel();
+    _notifySub = null;
+    _outgoingSub?.cancel();
+    _outgoingSub = null;
+    _protocol?.dispose();
+    _protocol = null;
   }
 
   @override
@@ -304,9 +308,10 @@ class _ConnectionPageState extends State<ConnectionPage> {
   void forceDisconnection() async {
     if (connected) {
       connection.cancel();
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-        content: Text("Disconnected!"),
-      ));
+      _teardownConnection();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Disconnected!")),
+      );
       _startScan();
       setState(() {
         connected = false;
@@ -315,47 +320,55 @@ class _ConnectionPageState extends State<ConnectionPage> {
     }
   }
 
-  // --- 4. Building the UI (User Interface) ---
   @override
   Widget build(BuildContext context) {
     return Stack(
       children: [
         Scaffold(
-            appBar: AppBar(
-              backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-              title: Text(widget.title),
-            ),
-            body: RefreshIndicator(
-              onRefresh: () async {
-                return _startScan();
-              },
-              child: ListView.builder(
-                  itemCount: foundBleDevicesFiltered.length,
-                  itemBuilder: (context, index) => Card(
-                        child: ListTile(
-                          dense: true,
-                          onTap: () {
-                            if (!connecting) {
-                              _startConnection(index);
-                            }
-                          },
-                          subtitle: Text(foundBleDevicesFiltered[index].id),
-                          title: Text(
-                              "$index: ${foundBleDevicesFiltered[index].name}"),
-                        ),
-                      )),
-            )),
-
-        // --- Loading Overlay ---
+          appBar: AppBar(
+            backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+            title: Text(widget.title),
+          ),
+          body: RefreshIndicator(
+            onRefresh: () async => _startScan(),
+            child: foundBleDevicesFiltered.isEmpty
+                ? ListView(
+                    children: [
+                      const SizedBox(height: 80),
+                      Center(
+                        child: Text(scanning
+                            ? 'Scanning for "$bleDeviceNameFilter" devices...'
+                            : 'No devices found. Pull to rescan.'),
+                      ),
+                    ],
+                  )
+                : ListView.builder(
+                    itemCount: foundBleDevicesFiltered.length,
+                    itemBuilder: (context, index) => Card(
+                      child: ListTile(
+                        dense: true,
+                        onTap: () {
+                          if (!connecting) _startConnection(index);
+                        },
+                        subtitle: Text(foundBleDevicesFiltered[index].id),
+                        title: Text(
+                            "$index: ${foundBleDevicesFiltered[index].name}"),
+                      ),
+                    ),
+                  ),
+          ),
+          floatingActionButton: FloatingActionButton.extended(
+            onPressed: scanning ? null : _startScan,
+            icon: const Icon(Icons.bluetooth_searching),
+            label: Text(scanning ? 'Scanning…' : 'Connetti'),
+          ),
+        ),
         if (connecting)
           const Opacity(
             opacity: 0.5,
             child: ModalBarrier(dismissible: false, color: Colors.black),
           ),
-        if (connecting)
-          const Center(
-            child: CircularProgressIndicator(),
-          ),
+        if (connecting) const Center(child: CircularProgressIndicator()),
       ],
     );
   }

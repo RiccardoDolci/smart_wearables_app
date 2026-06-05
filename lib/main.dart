@@ -17,7 +17,7 @@ class MyApp extends StatelessWidget {
         useMaterial3: true,
       ),
 
-      home: const ConnectionPage(title: 'Connect your device!'),
+      home: const ConnectionPage(title: 'Smart Wearables'),
     );
   }
 }
