@@ -303,9 +303,6 @@ class _LivePageState extends State<LivePage> {
             style: TextStyle(fontWeight: FontWeight.bold)),
         const SizedBox(height: 8),
         Card(
-          elevation: 2,
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(6, 14, 12, 8),
             child: SizedBox(
@@ -322,7 +319,7 @@ class _LivePageState extends State<LivePage> {
                   yMin: yMin,
                   yMax: yMax,
                   irHz: _irHz,
-                  color: Colors.deepOrange,
+                  color: Theme.of(context).colorScheme.primary,
                 ),
               ),
             ),

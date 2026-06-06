@@ -140,7 +140,7 @@ class _StoricoPageState extends State<StoricoPage> {
     final file = await widget.store.exportCsv();
     await Share.shareXFiles(
       [XFile(file.path, mimeType: 'text/csv')],
-      subject: 'Smart Wearables - dati storici',
+      subject: 'Smart Fitness Glasses - dati storici',
     );
   }
 
@@ -284,21 +284,26 @@ class _StoricoPageState extends State<StoricoPage> {
   static const int _markerThreshold = 60;
 
   Widget _chartFrame(String title, List<_TimePoint> data, Widget chart) {
-    return SizedBox(
-      height: 240,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-          Expanded(
-            child: data.isEmpty
-                ? const Center(
-                    child: Text('Nessun dato valido',
-                        style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  )
-                : chart,
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
+        child: SizedBox(
+          height: 240,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              Expanded(
+                child: data.isEmpty
+                    ? const Center(
+                        child: Text('Nessun dato valido',
+                            style: TextStyle(color: Colors.grey, fontSize: 12)),
+                      )
+                    : chart,
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }

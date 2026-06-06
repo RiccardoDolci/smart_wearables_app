@@ -1,11 +1,11 @@
 {
-    "name": "smart_wearables_app",
-    "short_name": "smart_wearables_app",
+    "name": "Smart Fitness Glasses",
+    "short_name": "Smart Fitness Glasses",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "background_color": "#EFF7F1",
+    "theme_color": "#7FC8A0",
+    "description": "Smart Fitness Glasses",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
