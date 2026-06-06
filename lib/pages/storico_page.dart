@@ -308,12 +308,44 @@ class _StoricoPageState extends State<StoricoPage> {
     );
   }
 
+  // Wall-clock X axis. Syncfusion's default DateTime labels collapse to "mm:ss"
+  // for short ranges (e.g. "42:30"), which reads like a broken time-of-day under
+  // the "Ora" axis. Format labels explicitly instead, widening from HH:mm:ss to
+  // HH:mm to "dd/MM HH:mm" as the data covers more time, so the axis always shows
+  // a real time. (Records carry Unix-epoch `ts`; DateTime.fromMillisecondsSinceEpoch
+  // renders them in local time — see history_store/ble_protocol.)
+  DateTimeAxis _timeAxis(List<_TimePoint> data) {
+    final format = _labelFormatFor(data);
+    return DateTimeAxis(
+      title: const AxisTitle(text: 'Ora'),
+      axisLabelFormatter: (AxisLabelRenderDetails details) {
+        final dt = DateTime.fromMillisecondsSinceEpoch(details.value.toInt());
+        return ChartAxisLabel(format(dt), details.textStyle);
+      },
+    );
+  }
+
+  String Function(DateTime) _labelFormatFor(List<_TimePoint> data) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    String hm(DateTime d) => '${two(d.hour)}:${two(d.minute)}';
+    String hms(DateTime d) => '${hm(d)}:${two(d.second)}';
+    String dmHm(DateTime d) => '${two(d.day)}/${two(d.month)} ${hm(d)}';
+
+    if (data.length < 2) return hms; // single point: show seconds for precision
+    // data is ascending by time (synced records / sorted bins).
+    final spanSeconds =
+        data.last.time.difference(data.first.time).inSeconds.abs();
+    if (spanSeconds >= 36 * 3600) return dmHm; // multi-day: add the date
+    if (spanSeconds >= 90) return hm; // minutes/hours apart: HH:mm is enough
+    return hms; // tight window: seconds matter
+  }
+
   Widget _lineChart(String title, List<_TimePoint> data, Color color) {
     return _chartFrame(
       title,
       data,
       SfCartesianChart(
-        primaryXAxis: const DateTimeAxis(title: AxisTitle(text: 'Ora')),
+        primaryXAxis: _timeAxis(data),
         trackballBehavior: TrackballBehavior(
           enable: true,
           activationMode: ActivationMode.singleTap,
@@ -338,7 +370,7 @@ class _StoricoPageState extends State<StoricoPage> {
       title,
       data,
       SfCartesianChart(
-        primaryXAxis: const DateTimeAxis(title: AxisTitle(text: 'Ora')),
+        primaryXAxis: _timeAxis(data),
         tooltipBehavior: TooltipBehavior(enable: true),
         series: <ColumnSeries<_TimePoint, DateTime>>[
           ColumnSeries<_TimePoint, DateTime>(
