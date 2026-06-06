@@ -85,11 +85,13 @@ class HistoryStore {
     final dir = await getApplicationDocumentsDirectory();
     final f = File('${dir.path}/smart_wearables_history.csv');
     final sb = StringBuffer();
-    sb.writeln('ts,datetime_iso,temp_c,hr,spo2,steps_delta,synced');
+    // datetime is LOCAL time to match the Storico charts (which render
+    // fromMillisecondsSinceEpoch in local time); the raw epoch `ts` column stays
+    // for an unambiguous machine-readable value.
+    sb.writeln('ts,datetime_local,temp_c,hr,spo2,steps_delta,synced');
     for (final r in records) {
       final iso = r.synced
-          ? DateTime.fromMillisecondsSinceEpoch(r.ts * 1000, isUtc: true)
-              .toIso8601String()
+          ? DateTime.fromMillisecondsSinceEpoch(r.ts * 1000).toIso8601String()
           : '';
       sb.writeln(
         '${r.ts},$iso,${r.tempC.toStringAsFixed(2)},${r.hr},'

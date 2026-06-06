@@ -29,7 +29,14 @@ class _ConnectionPageState extends State<ConnectionPage> {
 
   late StreamSubscription<DiscoveredDevice> scanStream;
   late Stream<ConnectionStateUpdate> currentConnectionStream;
-  late StreamSubscription<ConnectionStateUpdate> connection;
+  StreamSubscription<ConnectionStateUpdate>? connection;
+
+  // Watchdog for a connect attempt that never resolves. flutter_reactive_ble
+  // can sit in "connecting" forever without emitting connected/disconnected; if
+  // that happens we must clear `connecting` ourselves, otherwise the spinner
+  // sticks and the device-tap guard (`if (!connecting)`) locks the user out.
+  Timer? _connectWatchdog;
+  static const Duration _connectTimeout = Duration(seconds: 10);
 
   QualifiedCharacteristic? _rxCharacteristic;
   QualifiedCharacteristic? _txCharacteristic;
@@ -46,6 +53,16 @@ class _ConnectionPageState extends State<ConnectionPage> {
 
   // The protocol/data layer for the active connection.
   BleProtocol? _protocol;
+
+  // RTC time-sync state (ble_protocol.md §6/§7). We resend `T` until the board
+  // confirms with `T,OK`, so the clock is set even if the first write races
+  // service discovery — otherwise every stored record stays boot-relative and
+  // the Storico graphs hide them all.
+  StreamSubscription<String>? _ackSub;
+  Timer? _timeSyncTimer;
+  int _timeSyncAttempts = 0;
+  bool _timeSynced = false;
+  static const int _maxTimeSyncAttempts = 5;
 
   void refreshScreen() {
     if (mounted) setState(() {});
@@ -136,18 +153,28 @@ class _ConnectionPageState extends State<ConnectionPage> {
 
   void _startConnection(int index) async {
     if (scanning) {
-      scanStream.cancel();
+      await scanStream.cancel();
       scanning = false;
     }
 
-    if (!connected) {
-      setState(() => connecting = true);
+    // Re-entrancy guard: a second tap while already connecting/connected would
+    // start a parallel connect and leak the first subscription.
+    if (connected || connecting) return;
 
-      final deviceId = foundBleDevicesFiltered[index].id;
+    setState(() => connecting = true);
 
-      // Larger MTU helps batched IR lines arrive in one notification.
-      await flutterReactiveBle.requestMtu(deviceId: deviceId, mtu: 512);
+    final deviceId = foundBleDevicesFiltered[index].id;
 
+    // Drop any leaked subscription from a previous attempt before starting a new
+    // one. A lingering connectToDevice subscription keeps the OS BLE stack in
+    // "connecting", which is a common cause of the next attempt hanging.
+    await connection?.cancel();
+    connection = null;
+
+    // Arm the watchdog so a never-resolving connect still clears the spinner.
+    _armConnectWatchdog();
+
+    try {
       currentConnectionStream = flutterReactiveBle.connectToDevice(
         id: deviceId,
         connectionTimeout: const Duration(seconds: 5),
@@ -165,18 +192,46 @@ class _ConnectionPageState extends State<ConnectionPage> {
         }
         refreshScreen();
       }, onError: (Object error) {
-        connecting = false;
-        connected = false;
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Connection failed!")),
-          );
-        }
-        debugPrint("ERROR during connection: $error \n");
-        _startScan();
-        refreshScreen();
+        _failConnection("Connection failed!", error);
       });
+    } catch (e) {
+      // connectToDevice itself threw synchronously (e.g. invalid id / adapter
+      // off) — recover instead of leaving the spinner stuck.
+      _failConnection("Connection failed!", e);
     }
+  }
+
+  // Note: MTU negotiation used to run here, BEFORE the device was connected,
+  // which made the connect hang. It now runs in [connectionProcedure], after the
+  // `connected` event, and is non-fatal.
+  void _armConnectWatchdog() {
+    _connectWatchdog?.cancel();
+    _connectWatchdog = Timer(_connectTimeout, () {
+      if (connected) return;
+      debugPrint(
+          "Connect watchdog: no connection within ${_connectTimeout.inSeconds}s");
+      _failConnection("Connection timed out. Tap to retry.", "watchdog");
+    });
+  }
+
+  // Single recovery path for any failed/stuck connect: clear the watchdog and
+  // subscription, reset the flags (so the tap-guard releases), tell the user,
+  // and go back to scanning so a retry is one tap away.
+  void _failConnection(String message, Object error) {
+    _connectWatchdog?.cancel();
+    _connectWatchdog = null;
+    connection?.cancel();
+    connection = null;
+    connecting = false;
+    connected = false;
+    debugPrint("Connection failure ($error)");
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(message)),
+      );
+    }
+    _startScan();
+    refreshScreen();
   }
 
   void connectingProcedure(String id) {
@@ -186,15 +241,32 @@ class _ConnectionPageState extends State<ConnectionPage> {
   }
 
   void connectionProcedure(String id, ConnectionStateUpdate event) {
+    _connectWatchdog?.cancel();
+    _connectWatchdog = null;
     connected = true;
     connecting = false;
     debugPrint("Connected to $id\n");
 
+    // Larger MTU helps batched IR lines arrive in one notification. This MUST
+    // happen after the device is connected; requesting it before connect is what
+    // made the connect hang. Fire-and-forget and non-fatal — a failed/declined
+    // MTU just means smaller notifications, not a broken link.
+    flutterReactiveBle
+        .requestMtu(deviceId: event.deviceId, mtu: 512)
+        .then((mtu) => debugPrint("MTU negotiated: $mtu"))
+        .catchError((Object e) {
+      debugPrint("requestMtu failed (non-fatal): $e");
+    });
+
     final protocol = BleProtocol();
     _protocol = protocol;
 
-    // --- 0. DEBUG: enumerate the real GATT services/characteristics. ---
-    _dumpServices(event.deviceId);
+    // --- 0. Discover services (also dumps them for debugging). Only once
+    //         discovery completes do we set the clock, so the `T` write can't
+    //         race service discovery and silently fail. ---
+    _dumpServices(event.deviceId).then((_) {
+      if (_protocol == protocol) _startTimeSync(protocol);
+    });
 
     // --- 1. RECEIVE (notify): feed raw chunks into the line parser. ---
     _rxCharacteristic = QualifiedCharacteristic(
@@ -237,9 +309,17 @@ class _ConnectionPageState extends State<ConnectionPage> {
       }
     });
 
-    // --- 3. Set time on connect (ble_protocol.md §6/§7). Small delay so
-    //         service discovery + notify subscription settle first. ---
-    Future.delayed(const Duration(milliseconds: 600), protocol.sendSetTime);
+    // --- 3. Watch for the board's `T,OK` so the resend loop can stop once the
+    //         clock is confirmed set. ---
+    _ackSub = protocol.acks.listen((ack) {
+      if (ack.startsWith('T,OK')) {
+        _timeSynced = true;
+        _timeSyncTimer?.cancel();
+        _timeSyncTimer = null;
+        debugPrint("RTC set confirmed: $ack");
+      }
+    });
+    // Time-sync itself (§0 above) is kicked off once service discovery resolves.
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("Connected!")),
@@ -254,9 +334,38 @@ class _ConnectionPageState extends State<ConnectionPage> {
     ).whenComplete(forceDisconnection);
   }
 
+  // --- RTC time sync ---
+
+  // Send `T,<epoch>` and keep resending until the board answers `T,OK`. The
+  // first attempt happens after service discovery so the write doesn't race it;
+  // each retry covers a dropped write or a board that wasn't ready yet.
+  void _startTimeSync(BleProtocol protocol) {
+    _timeSynced = false;
+    _timeSyncAttempts = 0;
+    _trySetTime(protocol);
+  }
+
+  void _trySetTime(BleProtocol protocol) {
+    // Bail out if we disconnected or a newer connection replaced this protocol.
+    if (_protocol != protocol || _timeSynced) return;
+    if (_timeSyncAttempts >= _maxTimeSyncAttempts) {
+      debugPrint("RTC set: no T,OK after $_timeSyncAttempts attempts; giving "
+          "up (T was still sent each time).");
+      return;
+    }
+    _timeSyncAttempts++;
+    protocol.sendSetTime(); // T,<current epoch seconds>
+    debugPrint("RTC set: sent T (attempt $_timeSyncAttempts)");
+    _timeSyncTimer?.cancel();
+    _timeSyncTimer = Timer(
+      const Duration(milliseconds: 1500),
+      () => _trySetTime(protocol),
+    );
+  }
+
   // DEBUG: discover and print every service + characteristic and its
   // properties, so we can confirm which characteristic actually notifies.
-  void _dumpServices(String deviceId) async {
+  Future<void> _dumpServices(String deviceId) async {
     try {
       await flutterReactiveBle.discoverAllServices(deviceId);
       final services = await flutterReactiveBle.getDiscoveredServices(deviceId);
@@ -291,6 +400,12 @@ class _ConnectionPageState extends State<ConnectionPage> {
   }
 
   void _teardownConnection() {
+    _connectWatchdog?.cancel();
+    _connectWatchdog = null;
+    _timeSyncTimer?.cancel();
+    _timeSyncTimer = null;
+    _ackSub?.cancel();
+    _ackSub = null;
     _notifySub?.cancel();
     _notifySub = null;
     _outgoingSub?.cancel();
@@ -307,11 +422,14 @@ class _ConnectionPageState extends State<ConnectionPage> {
 
   void forceDisconnection() async {
     if (connected) {
-      connection.cancel();
+      await connection?.cancel();
+      connection = null;
       _teardownConnection();
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Disconnected!")),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("Disconnected!")),
+        );
+      }
       _startScan();
       setState(() {
         connected = false;

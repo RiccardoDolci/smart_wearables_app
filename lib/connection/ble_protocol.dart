@@ -123,10 +123,6 @@ class BleProtocol {
   /// Feed every incoming BLE notification chunk here. Lines may be split or
   /// merged across chunks; we buffer and cut on '\n'.
   void ingest(List<int> chunk) {
-    // TEMP DEBUG: see exactly what the board sends on the wire.
-    final ascii = String.fromCharCodes(chunk.map((b) => (b >= 32 && b < 127) ? b : 46));
-    // ignore: avoid_print
-    print('RX ${chunk.length}B raw=$chunk ascii="$ascii"');
     for (final b in chunk) {
       if (b == 0x0D) continue; // ignore \r
       if (b == 0x0A) {
@@ -224,8 +220,6 @@ class BleProtocol {
   // --- commands (App -> Board) ---
 
   void _send(String line) {
-    // ignore: avoid_print
-    print('TX "${line.replaceAll('\n', '\\n')}" bytes=${line.codeUnits}');
     _sendController.add(line.codeUnits);
   }
 

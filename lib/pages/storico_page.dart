@@ -10,10 +10,20 @@ import 'package:syncfusion_flutter_charts/charts.dart';
 /// HR, SpO2, steps-per-half-hour and temperature charts. Supports refresh,
 /// clear (board + local) and CSV export to the phone.
 class StoricoPage extends StatefulWidget {
-  const StoricoPage({super.key, required this.protocol, required this.store});
+  const StoricoPage({
+    super.key,
+    required this.protocol,
+    required this.store,
+    required this.enterTick,
+  });
 
   final BleProtocol protocol;
   final HistoryStore store;
+
+  /// Incremented by the parent each time Storico becomes the active tab, so the
+  /// page pulls a fresh history dump (with a spinner) without the parent having
+  /// to know about loading state.
+  final ValueNotifier<int> enterTick;
 
   @override
   State<StoricoPage> createState() => _StoricoPageState();
@@ -34,17 +44,40 @@ class _StoricoPageState extends State<StoricoPage> {
   bool _loadingDump = false;
   bool _clearing = false;
 
+  // True when the in-flight dump was triggered by the user (Refresh button), so
+  // we snackbar the result. A passive tab-switch pull stays silent.
+  bool _announceNextDump = false;
+
   @override
   void initState() {
     super.initState();
     _historySub = widget.protocol.history.listen(_onDump);
     _ackSub = widget.protocol.acks.listen(_onAck);
+    widget.enterTick.addListener(_onEnter);
+  }
+
+  // Storico became the active tab: pull silently (spinner only).
+  void _onEnter() => _pull(announce: false);
+
+  // Send H, show the spinner, and remember whether to announce the result.
+  void _pull({required bool announce}) {
+    if (!mounted) return;
+    setState(() {
+      _loadingDump = true;
+      _announceNextDump = announce;
+    });
+    widget.protocol.sendHistory();
   }
 
   Future<void> _onDump(HistoryDump dump) async {
     final added = await widget.store.merge(dump.records);
     if (!mounted) return;
-    setState(() => _loadingDump = false);
+    final announce = _announceNextDump;
+    setState(() {
+      _loadingDump = false;
+      _announceNextDump = false;
+    });
+    if (!announce) return; // passive pull: update charts quietly
     final msg = dump.complete
         ? 'Aggiornato: $added nuovi record (${dump.records.length} ricevuti).'
         : 'Dump incompleto (attesi ${dump.declaredCount}, ricevuti '
@@ -71,10 +104,7 @@ class _StoricoPageState extends State<StoricoPage> {
         .showSnackBar(SnackBar(content: Text(m)));
   }
 
-  void _refresh() {
-    setState(() => _loadingDump = true);
-    widget.protocol.sendHistory();
-  }
+  void _refresh() => _pull(announce: true);
 
   Future<void> _clear() async {
     final ok = await showDialog<bool>(
@@ -150,6 +180,7 @@ class _StoricoPageState extends State<StoricoPage> {
 
   @override
   void dispose() {
+    widget.enterTick.removeListener(_onEnter);
     _historySub.cancel();
     _ackSub.cancel();
     super.dispose();
@@ -248,7 +279,11 @@ class _StoricoPageState extends State<StoricoPage> {
     );
   }
 
-  Widget _lineChart(String title, List<_TimePoint> data, Color color) {
+  // Markers add clarity for a handful of points but become noise past a few
+  // dozen, so only show them on small series.
+  static const int _markerThreshold = 60;
+
+  Widget _chartFrame(String title, List<_TimePoint> data, Widget chart) {
     return SizedBox(
       height: 240,
       child: Column(
@@ -256,18 +291,37 @@ class _StoricoPageState extends State<StoricoPage> {
         children: [
           Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
           Expanded(
-            child: SfCartesianChart(
-              primaryXAxis: const DateTimeAxis(),
-              series: <LineSeries<_TimePoint, DateTime>>[
-                LineSeries<_TimePoint, DateTime>(
-                  dataSource: data,
-                  xValueMapper: (p, _) => p.time,
-                  yValueMapper: (p, _) => p.value,
-                  color: color,
-                  markerSettings: const MarkerSettings(isVisible: true),
-                ),
-              ],
-            ),
+            child: data.isEmpty
+                ? const Center(
+                    child: Text('Nessun dato valido',
+                        style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  )
+                : chart,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _lineChart(String title, List<_TimePoint> data, Color color) {
+    return _chartFrame(
+      title,
+      data,
+      SfCartesianChart(
+        primaryXAxis: const DateTimeAxis(title: AxisTitle(text: 'Ora')),
+        trackballBehavior: TrackballBehavior(
+          enable: true,
+          activationMode: ActivationMode.singleTap,
+          tooltipSettings: const InteractiveTooltip(enable: true),
+        ),
+        series: <LineSeries<_TimePoint, DateTime>>[
+          LineSeries<_TimePoint, DateTime>(
+            dataSource: data,
+            xValueMapper: (p, _) => p.time,
+            yValueMapper: (p, _) => p.value,
+            color: color,
+            markerSettings:
+                MarkerSettings(isVisible: data.length <= _markerThreshold),
           ),
         ],
       ),
@@ -275,24 +329,19 @@ class _StoricoPageState extends State<StoricoPage> {
   }
 
   Widget _barChart(String title, List<_TimePoint> data, Color color) {
-    return SizedBox(
-      height: 240,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-          Expanded(
-            child: SfCartesianChart(
-              primaryXAxis: const DateTimeAxis(),
-              series: <ColumnSeries<_TimePoint, DateTime>>[
-                ColumnSeries<_TimePoint, DateTime>(
-                  dataSource: data,
-                  xValueMapper: (p, _) => p.time,
-                  yValueMapper: (p, _) => p.value,
-                  color: color,
-                ),
-              ],
-            ),
+    return _chartFrame(
+      title,
+      data,
+      SfCartesianChart(
+        primaryXAxis: const DateTimeAxis(title: AxisTitle(text: 'Ora')),
+        tooltipBehavior: TooltipBehavior(enable: true),
+        series: <ColumnSeries<_TimePoint, DateTime>>[
+          ColumnSeries<_TimePoint, DateTime>(
+            dataSource: data,
+            xValueMapper: (p, _) => p.time,
+            yValueMapper: (p, _) => p.value,
+            color: color,
+            enableTooltip: true,
           ),
         ],
       ),

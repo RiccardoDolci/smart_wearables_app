@@ -23,35 +23,39 @@ class _ConnectedScaffoldState extends State<ConnectedScaffold> {
   // Notifies the Live page to reset its IR buffer when we re-enter Live.
   final ValueNotifier<int> _liveResetTick = ValueNotifier<int>(0);
 
+  // Notifies the Storico page to pull history (it owns the spinner + dump
+  // handling) whenever it becomes the active tab.
+  final ValueNotifier<int> _storicoEnterTick = ValueNotifier<int>(0);
+
   @override
   void initState() {
     super.initState();
     _store.load().then((_) {
       if (mounted) setState(() => _storeLoaded = true);
     });
-    // Live is the default tab -> start live streaming. Delay so it lands
-    // after the connect-time T command (set clock before streaming).
-    Future.delayed(const Duration(milliseconds: 900), () {
-      if (mounted) widget.protocol.sendLive();
-    });
+    // The Live page arms its own streaming (sends L and retries until data
+    // actually flows), so there is no fragile fixed-delay kickoff here — that
+    // one-shot L was lost on first connect while discovery/notify were settling.
   }
 
   void _onTabSelected(int i) {
     if (i == _index) return;
     setState(() => _index = i);
     if (i == 0) {
-      // Returning to Live: restart stream + reset stale IR waveform.
+      // Returning to Live: the Live page resets its waveform and re-arms
+      // streaming (resends L) off this tick.
       _liveResetTick.value++;
-      widget.protocol.sendLive();
     } else {
-      // Storico: H stops live and pulls the history dump.
-      widget.protocol.sendHistory();
+      // Storico: tell the page to pull. It sends H (which stops live), shows a
+      // spinner, and merges the dump silently — no snackbar on a passive switch.
+      _storicoEnterTick.value++;
     }
   }
 
   @override
   void dispose() {
     _liveResetTick.dispose();
+    _storicoEnterTick.dispose();
     super.dispose();
   }
 
@@ -74,6 +78,7 @@ class _ConnectedScaffoldState extends State<ConnectedScaffold> {
                 StoricoPage(
                   protocol: widget.protocol,
                   store: _store,
+                  enterTick: _storicoEnterTick,
                 ),
               ],
             ),
